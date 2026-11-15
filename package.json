@@ -1,0 +1,22 @@
+{
+  "name": "cost-sweeper",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Parallel Copilot SDK cost analysis using local read-only StackQL MCP.",
+  "engines": {
+    "node": ">=22.16.0"
+  },
+  "scripts": {
+    "start": "node scripts/copilot.mjs",
+    "sweep": "node scripts/copilot.mjs",
+    "context": "node scripts/cost-sweep.mjs context",
+    "report": "node scripts/cost-sweep.mjs report",
+    "mcp": "node scripts/stackql-mcp.mjs",
+    "test": "node --test",
+    "test:mcp": "node scripts/check-mcp.mjs"
+  },
+  "dependencies": {
+    "@github/copilot-sdk": "1.0.34"
+  }
+}

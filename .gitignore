@@ -1,0 +1,9 @@
+.env
+.env.*
+!.env.example
+outputs/
+output/
+.stackql/
+**/stackql_mcp_server_*.log
+**/stackql_mcp_server_*.jsonl
+node_modules/

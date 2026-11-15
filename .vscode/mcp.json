@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "cost-sweeper-stackql": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["${workspaceFolder}/scripts/stackql-mcp.mjs"]
+    }
+  }
+}
