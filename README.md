@@ -42,6 +42,10 @@ default selects every provider Markdown file. Delete a file to exclude that
 provider or add `config/{registry-provider}.md` to include another provider.
 The app reads the global file and selected provider files at the start of
 every sweep. It does not convert them into hard-coded scopes or rate cards.
+The AWS prose uses an evidence-first sequence: identity and enabled regions,
+core EC2 and EBS inventory across those regions, aggregate billing, then the
+remaining service priorities. It bounds repeated searches and failed-query
+corrections without treating inaccessible services as empty.
 
 ## Run a sweep
 
@@ -130,10 +134,23 @@ The following checks are enforced by code:
 
 - Every worker must call `server_info`; the MCP connection must confirm
   `read_only` and expose exactly the configured allowlist.
+- Wrapped tools preserve StackQL's native API descriptions and input schemas,
+  with application constraints appended rather than replacing server guidance.
+- MCP initialization `instructions` are preserved verbatim and included in
+  every provider's system context. Native tool names in that guidance map to
+  the registered `stackql_*` wrappers. Application safety and business policy
+  still apply; cloud result rows never become system instructions.
 - Calls are serialized within each worker, so an overlapping child call cannot
   check its guard before the parent's evidence is committed. Separate provider
   workers still run concurrently. Workers must await parent results before
-  constructing dependent arguments.
+  constructing dependent arguments. This does not serialize StackQL's internal
+  query fan-out: AWS policy prefers one regional `IN (...)` SELECT per resource
+  so StackQL can dispatch regional requests concurrently and collate the result.
+  Scope attribution, underlying API charges, pagination, and failures still
+  need evidence.
+- Successful metadata and query-library responses are cached within each
+  provider worker for identical arguments. Pulling a provider clears that
+  cache. Inventory SELECT results and validation results are not cached.
 - The selected provider must be present in `list_registry` before the worker
   can pull its exact listed version. It must then be confirmed in
   `list_providers` at a registry-listed version before service discovery. All
@@ -144,7 +161,8 @@ The following checks are enforced by code:
   descriptions must provide output and input field names before query construction.
 - SELECT table paths and referenced fields must be grounded in discovered and
   described metadata. The same query must pass `validate_select_query` before
-  `run_select_query`.
+  `run_select_query`. Output aliases in ordering and grouping are not mistaken
+  for source columns; the underlying projected fields still require discovery.
 - Validation accepts StackQL's successful `valid: true` response with omitted,
   null, or empty errors; reported validation errors remain failures. Correctable
   guard rejections are returned to the model explicitly, not hidden behind an
@@ -203,6 +221,14 @@ Color is restrained and disabled for redirected output or when NO_COLOR is set.
 No SQL, cloud payloads, or model reasoning is printed in progress.
 Worker failures include a safe reason immediately and in the evidence table,
 not just a bare "failed" label.
+If the shared MCP connection breaks after collection starts, the report and
+query-library worksheet retain already validated provider results. Coverage is
+marked incomplete and the sweep exits with code 2, rather than discarding the
+report. The host distinguishes protocol, stream, message-size, and request
+timeout failures without exposing raw backend errors or reading logs.
+Request timeout or a closed protocol stream stops further calls on that
+connection. A failed startup safety check still stops the sweep without a
+report.
 The wrapper requests machine-readable JSON for tools that support a format
 argument, rather than depending on the model to select it. Correctable
 rejections include the actual validation reason. The SDK's structured-output

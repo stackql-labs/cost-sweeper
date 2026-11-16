@@ -149,7 +149,12 @@ function validateQueryFields(query, schemas) {
   const withoutTables = query
     .replace(/'(?:''|[^'])*'/g, ' ')
     .replace(/\b(?:FROM|JOIN)\s+[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+){2}/gi, ' ');
-  for (const field of referencedFields(withoutTables, aliases)) {
+  const expressionAliases = new Set(aliases);
+  for (const expression of projections) {
+    const alias = expression.match(/\bAS\s+([a-zA-Z_][\w]*)\s*$/i)?.[1];
+    if (alias) expressionAliases.add(alias.toLowerCase());
+  }
+  for (const field of referencedFields(withoutTables, expressionAliases)) {
     if (!describedFields.has(field.toLowerCase())) {
       throw new Error(`SQL field ${field} was not returned by describe_method for a discovered table.`);
     }

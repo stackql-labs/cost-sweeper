@@ -14,8 +14,9 @@ try {
   await writeFile(join(directory, '.env'), '# Empty smoke-test credentials; no cloud API calls.\n');
   const server = await prepareServer(directory);
   client = await connectStackQL(server);
+  if (!client.instructions.trim()) throw new Error('The native MCP initialization did not provide server guidance.');
   if ((await stat(server.auditPath)).size === 0) throw new Error('The JSONL audit sink did not record the metadata handshake.');
-  console.log(`StackQL stdio MCP ready: ${client.tools.size} allowlisted tools; read_only mode confirmed; no cloud queries performed.`);
+  console.log(`StackQL stdio MCP ready: ${client.tools.size} allowlisted tools; ${client.instructions.length} initialization guidance characters retained; read_only mode confirmed; no cloud queries performed.`);
 } catch (error) {
   console.error(`MCP check failed: ${error.message}`);
   process.exitCode = 1;

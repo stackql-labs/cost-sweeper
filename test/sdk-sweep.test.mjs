@@ -10,6 +10,7 @@ import { readOnlyTools } from '../scripts/stackql-mcp.mjs';
 import { runProviderWorker, createWorkerTools, createUsageCollector, providerResultSchema, validateProviderSubmission } from '../scripts/sweep.mjs';
 import { createProgressLogger, renderSweepTables, visibleWidth } from '../scripts/console.mjs';
 import { QueryLibrarySuggestions, parameterizeQuery, publishQueryLibrarySuggestions } from '../scripts/query-library-suggestions.mjs';
+import { StackQLConnectionError } from '../scripts/stackql-client.mjs';
 
 async function temporaryRoot(t) {
   await mkdir(join(projectRoot, '.stackql'), { recursive: true });
@@ -144,6 +145,7 @@ test('one isolated SDK session per selected provider is restricted, parallel, an
   let stackqlCloses = 0;
   const fakeStackQL = {
     tools: toolMetadata(),
+    instructions: 'Native MCP initialize guidance:\nDo not rediscover the same resource for each query.\n',
     failure: null,
     async close() { stackqlCloses += 1; },
   };
@@ -175,6 +177,9 @@ test('one isolated SDK session per selected provider is restricted, parallel, an
     assert.equal(config.tools.some((tool) => tool.name === 'shell' || tool.name.includes('filesystem')), false);
     assert.match(config.systemMessage.content, new RegExp(`selected StackQL registry provider "${provider}"`));
     assert.match(config.systemMessage.content, /untrusted evidence/);
+    assert.ok(config.systemMessage.content.includes(fakeStackQL.instructions),
+      'every provider receives the server initialization guidance verbatim');
+    assert.match(config.systemMessage.content, /run_select_query maps to stackql_run_select_query/);
   }
   assert.equal(outputs.length, 2);
   assert.equal(result.suggestionsPath, join(root, 'output', 'query_library_suggestions_2026-11-16-00-00-00.md'));
@@ -226,6 +231,148 @@ test('query library suggestions group misses by provider and prompt and deduplic
   assert.match(markdown, /No new executable query was established/);
   await assert.rejects(publishQueryLibrarySuggestions(suggestions, '2026-11-16T00:00:00.000Z', root), /never overwritten/);
   assert.equal(await readFile(path, 'utf8'), markdown);
+});
+
+test('a shared MCP failure retains validated resource evidence, reports, usage, and suggestions', async (t) => {
+  for (const failure of [new StackQLConnectionError('invalid_protocol'), new Error('private backend payload')]) {
+    await t.test(failure.name, async (t) => {
+      const root = await temporaryRoot(t);
+      const partial = {
+        ...failedResult('aws'), status: 'partial', errors: [],
+        coverage: ['One EC2 inventory query completed.'], gaps: ['Billing unavailable.'],
+        resources: [{
+          id: 'i-retained', service: 'ec2', scope: 'unknown', region: 'unknown',
+          state: 'running', currency: null, dailyCost: null, confidence: 'unknown',
+          basis: 'No verified pricing.', source: 'Test SELECT evidence.', assumptions: [],
+        }],
+      };
+      const client = new FakeClient([partial]);
+      const metadata = toolMetadata();
+      for (const tool of metadata.values()) tool.inputSchema.properties.format = { type: 'string' };
+      let closed = false;
+      const stackql = {
+        tools: metadata, failure: null,
+        async callTool(name) {
+          if (name === 'server_info') return { content: [{ type: 'text', text: 'mode: read_only\nis_read_only: true' }] };
+          const rows = {
+            list_registry: [{ provider: 'aws', version: 'v1' }],
+            list_providers: [{ name: 'aws', version: 'v1' }],
+            list_services: [{ name: 'ec2' }],
+            list_resources: [{ name: 'instances' }],
+            list_methods: [{ MethodName: 'DescribeInstances', SQLVerb: 'SELECT' }],
+            describe_method: [{ name: 'id', param_type: 'output' }, { name: 'state', param_type: 'output' }],
+            run_select_query: [{ id: 'i-retained', state: 'running' }],
+          };
+          return { structuredContent: name === 'validate_select_query' ? { valid: true } : { rows: rows[name] } };
+        },
+        async close() { closed = true; },
+      };
+      const createSession = client.createSession.bind(client);
+      client.createSession = async (config) => {
+        const session = await createSession(config);
+        const sendAndWait = session.sendAndWait.bind(session);
+        session.sendAndWait = async (options) => {
+          const query = 'SELECT id, state FROM aws.ec2.instances';
+          const calls = [
+            ['server_info', {}], ['list_registry', {}], ['list_providers', {}],
+            ['list_services', { provider: 'aws' }],
+            ['list_resources', { service: 'ec2' }],
+            ['list_methods', { service: 'ec2', resource: 'instances' }],
+            ['describe_method', { service: 'ec2', resource: 'instances', method: 'DescribeInstances' }],
+            ['validate_select_query', { query }], ['run_select_query', { query }],
+          ];
+          for (const [name, args] of calls) {
+            const result = await config.tools.find((tool) => tool.name === `stackql_${name}`).handler(args);
+            assert.equal(typeof result, 'string');
+          }
+          stackql.failure = failure;
+          return sendAndWait(options);
+        };
+        return session;
+      };
+      const outputs = [];
+      const progress = [];
+      const result = await executeSweep(['aws', '--output-md'], {
+        root, now: new Date('2026-11-16T00:00:00Z'),
+        createClient: () => client, openStackQL: async () => stackql,
+        onProgress: (event) => progress.push(event), writeOutput: (text) => outputs.push(text),
+      });
+      assert.equal(result.exitCode, 2);
+      assert.equal(closed && client.stopped, true);
+      const markdown = await readFile(result.outputPath, 'utf8');
+      assert.match(markdown, /i-retained/);
+      assert.match(markdown, /Unqueried scopes remain unknown/);
+      assert.match(outputs[0], /i-retained/);
+      assert.match(outputs[0], /copilot-test-model/);
+      assert.match(await readFile(result.suggestionsPath, 'utf8'), /SELECT id, state/);
+      assert.ok(progress.some((event) => event.status === 'warning' && /Retaining validated/.test(event.detail)));
+      assert.doesNotMatch(JSON.stringify({ outputs, progress, markdown }), /private backend payload/);
+      if (failure instanceof StackQLConnectionError) assert.match(markdown, /invalid JSON protocol/);
+    });
+  }
+});
+
+test('worker metadata is reused while failed calls and provider pulls invalidate reuse appropriately', async () => {
+  const metadata = toolMetadata();
+  metadata.get('list_registry').inputSchema.properties.format = { type: 'string' };
+  const calls = [];
+  let searchFails = true;
+  const stackql = {
+    tools: metadata,
+    async callTool(name) {
+      calls.push(name);
+      if (name === 'server_info') return { content: [{ type: 'text', text: 'mode: read_only\nis_read_only: true' }] };
+      if (name === 'list_registry') return { structuredContent: { rows: [{ provider: 'aws', version: 'v1' }] } };
+      if (name === 'query_library_search' && searchFails) throw new Error('private failure payload');
+      return { structuredContent: { hits: [], miss: true } };
+    },
+  };
+  const { tools } = createWorkerTools('aws', '2026-11-16T00:00:00Z', stackql, { value: null });
+  const call = (name, args = {}) => tools.find((tool) => tool.name === `stackql_${name}`).handler(args);
+  await call('server_info');
+  await call('server_info');
+  await call('list_registry');
+  await call('list_registry');
+  assert.deepEqual(calls, ['server_info', 'list_registry']);
+  const search = { intent: 'test inventory', service: 'ec2' };
+  assert.equal((await call('query_library_search', search)).resultType, 'failure');
+  searchFails = false;
+  assert.equal(typeof await call('query_library_search', search), 'string');
+  assert.equal(typeof await call('query_library_search', { service: 'ec2', intent: 'test inventory' }), 'string');
+  assert.equal(calls.filter((name) => name === 'query_library_search').length, 2);
+  await call('pull_provider', { provider: 'aws', version: 'v1' });
+  await call('server_info');
+  assert.equal(calls.filter((name) => name === 'server_info').length, 2);
+  const count = calls.length;
+  stackql.failure = new StackQLConnectionError('input');
+  const stopped = await call('server_info');
+  assert.equal(stopped.resultType, 'failure');
+  assert.match(stopped.textResultForLlm, /Do not issue more tool calls/);
+  assert.equal(calls.length, count, 'broken connections do not receive calls, even for cached metadata');
+});
+
+test('aggregate output aliases do not become invented source fields in ordering or grouping', () => {
+  const guard = new GroundingGuard('aws');
+  guard.after('server_info', {}, {}, { content: [{ type: 'text', text: 'mode: read_only\nis_read_only: true' }] });
+  guard.services.add('s3');
+  guard.resources.set('s3\0metrics', true);
+  guard.describedFields.set('s3\0metrics', {
+    outputs: new Set(['bucket', 'bytes']), inputs: new Set(['region']),
+  });
+  const schema = { properties: { query: { type: 'string' } } };
+  for (const query of [
+    'SELECT bucket, MAX(bytes) AS max FROM aws.s3.metrics GROUP BY bucket ORDER BY max DESC',
+    'SELECT bucket AS name, SUM(bytes) AS total FROM aws.s3.metrics GROUP BY name ORDER BY total',
+  ]) {
+    assert.doesNotThrow(() => guard.before('validate_select_query', { query }, schema));
+    assert.throws(() => guard.before('run_select_query', { query }, schema), /Validate this exact SELECT/);
+  }
+  for (const query of [
+    'SELECT MAX(invented) AS max FROM aws.s3.metrics ORDER BY max',
+    'SELECT bucket, MAX(bytes) AS max FROM aws.s3.metrics WHERE invented = 1 ORDER BY max',
+    'SELECT max AS max FROM aws.s3.metrics ORDER BY max',
+    'SELECT bucket_region FROM aws.s3.metrics',
+  ]) assert.throws(() => guard.before('validate_select_query', { query }, schema), /not returned/);
 });
 
 test('query library suggestions omit executed existing entries and never promote guard-rejected queries', async () => {
@@ -300,7 +447,8 @@ test('guard failure delivers correctable feedback without the SDK rejected resul
 test('installed-provider discovery handles a no-argument schema and uses structured rows over Markdown', async () => {
   const definitions = [
     { name: 'server_info', inputSchema: { type: 'object' } },
-    { name: 'list_registry', inputSchema: { type: 'object', properties: { format: { type: 'string' } } } },
+    { name: 'list_registry', description: 'Registry tool documentation: versions contains the exact available versions.',
+      inputSchema: { type: 'object', properties: { format: { type: 'string' } } } },
     { name: 'list_providers', inputSchema: { type: 'object' } },
     { name: 'list_services', inputSchema: { type: 'object', properties: {
       provider: { type: 'string' }, format: { type: 'string' },
@@ -322,6 +470,8 @@ test('installed-provider discovery handles a no-argument schema and uses structu
   };
   const { tools } = createWorkerTools('aws', '2026-11-16T00:00:00Z', stackql, { value: null });
   const tool = (name) => tools.find((item) => item.name === `stackql_${name}`);
+  assert.ok(tool('list_registry').description.startsWith(definitions[1].description),
+    'native MCP API documentation must reach the model instead of being replaced by generic constraints');
   assert.deepEqual(tool('list_providers').parameters.properties, {});
   await tool('server_info').handler();
   await tool('list_registry').handler({});
@@ -694,6 +844,9 @@ test('grounding guard enforces registry-backed parent discovery and observed res
   ] }));
   const query = 'SELECT instanceId, state FROM aws.ec2.instances';
   const querySchema = schema({ query: { type: 'string' } });
+  const regionalBatch = `${query} WHERE region IN ('us-east-1', 'us-west-2')`;
+  assert.doesNotThrow(() => guard.before('validate_select_query', { query: regionalBatch }, querySchema));
+  assert.throws(() => guard.before('run_select_query', { query: regionalBatch }, querySchema), /Validate this exact SELECT/);
   assert.throws(() => guard.before('validate_select_query', {
     query: 'SELECT accountId, state FROM aws.ec2.instances',
   }, querySchema), /not returned as an output/);

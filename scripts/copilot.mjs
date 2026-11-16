@@ -6,7 +6,7 @@ import { join, resolve } from 'node:path';
 import { resolveSweepContext } from './context.mjs';
 import { createProgressLogger, renderSweepTables } from './console.mjs';
 import { publishReport } from './report.mjs';
-import { connectStackQL } from './stackql-client.mjs';
+import { connectStackQL, safeStackQLFailure } from './stackql-client.mjs';
 import { prepareServer, resetServerLogs } from './stackql-mcp.mjs';
 import { runProviderWorkers } from './sweep.mjs';
 import { projectRoot } from './runtime.mjs';
@@ -71,7 +71,13 @@ export async function executeSweep(args, {
         onProgress,
       });
       if (stackql.failure) {
-        throw new Error('The shared cost-sweeper-stackql MCP connection failed during collection. No aggregate report was published.');
+        const message = safeStackQLFailure(stackql.failure);
+        onProgress({ status: 'warning', detail: `${message} Retaining validated provider evidence; coverage is incomplete.` });
+        for (const provider of workers.providers) {
+          if (provider.status === 'complete') provider.status = 'partial';
+          provider.errors.push(message);
+          provider.gaps.push('Collection was interrupted by a shared MCP connection failure. Unqueried scopes remain unknown.');
+        }
       }
       if (workers.cleanupFailed) {
         throw new Error('A Copilot worker session could not be removed from local session storage. No aggregate report was published.');

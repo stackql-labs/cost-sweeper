@@ -7,6 +7,29 @@ const REQUEST_TIMEOUT_MS = 120_000;
 const MAX_MESSAGE_BYTES = 32 * 1024 * 1024;
 const EXPECTED_TOOLS = new Set(readOnlyTools);
 
+const connectionErrors = {
+  stream: 'StackQL MCP protocol stream closed or failed.',
+  startup: 'Could not start StackQL MCP. Check that StackQL is on PATH.',
+  exited: 'StackQL MCP exited before collection completed.',
+  input: 'StackQL MCP input stream closed unexpectedly.',
+  oversized: 'StackQL MCP returned a protocol message larger than the 32 MiB limit. Narrow inventory projections and scopes.',
+  invalid_protocol: 'StackQL MCP returned invalid JSON protocol data.',
+  timeout: 'StackQL MCP exceeded the request timeout. Collection on this connection has stopped.',
+  write: 'Could not send a request or initialization notification to StackQL MCP.',
+};
+
+export class StackQLConnectionError extends Error {
+  constructor(reason) {
+    super(connectionErrors[reason] ?? 'StackQL MCP transport failed.');
+    this.name = 'StackQLConnectionError';
+  }
+}
+
+export function safeStackQLFailure(error) {
+  return error instanceof StackQLConnectionError ? error.message
+    : 'The shared cost-sweeper-stackql MCP connection failed during collection.';
+}
+
 export class StackQLClient {
   constructor(server, { spawnProcess = spawn, timeoutMs = REQUEST_TIMEOUT_MS } = {}) {
     this.child = spawnProcess(server.command, server.args, {
@@ -20,29 +43,37 @@ export class StackQLClient {
     this.failure = null;
     this.closed = false;
     this.tools = new Map();
+    this.instructions = '';
     this.reader = createInterface({ input: this.child.stdout, crlfDelay: Infinity });
     this.reader.on('line', (line) => this.onLine(line));
-    this.reader.on('error', () => this.fail(new Error('StackQL MCP protocol stream failed.')));
-    this.child.once('error', (error) => {
-      this.fail(new Error(`Could not start StackQL MCP (${error.code ?? 'unknown error'}). Check that StackQL is on PATH.`));
+    this.reader.on('error', () => this.fail(new StackQLConnectionError('stream')));
+    this.reader.once('close', () => {
+      if (!this.closed) this.fail(new StackQLConnectionError('stream'));
+    });
+    this.child.once('error', () => {
+      this.fail(new StackQLConnectionError('startup'));
     });
     this.child.once('close', () => {
-      if (!this.closed) this.fail(new Error('StackQL MCP exited before the worker completed.'));
+      if (!this.closed) this.fail(new StackQLConnectionError('exited'));
     });
-    this.child.stdin.on('error', () => this.fail(new Error('StackQL MCP input stream closed unexpectedly.')));
+    this.child.stdin.on('error', () => this.fail(new StackQLConnectionError('input')));
     this.child.stderr.on('data', () => {});
   }
 
   onLine(line) {
     if (Buffer.byteLength(line, 'utf8') > MAX_MESSAGE_BYTES) {
-      this.fail(new Error('StackQL MCP returned an oversized protocol message.'));
+      this.fail(new StackQLConnectionError('oversized'));
       return;
     }
     let message;
     try {
       message = JSON.parse(line);
     } catch {
-      this.fail(new Error('StackQL MCP returned invalid protocol data.'));
+      this.fail(new StackQLConnectionError('invalid_protocol'));
+      return;
+    }
+    if (!message || typeof message !== 'object' || Array.isArray(message)) {
+      this.fail(new StackQLConnectionError('invalid_protocol'));
       return;
     }
     const waiting = this.pending.get(message.id);
@@ -72,15 +103,12 @@ export class StackQLClient {
     return new Promise((resolve, reject) => {
       const id = this.nextId++;
       const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`StackQL MCP timed out during ${method}.`));
+        this.fail(new StackQLConnectionError('timeout'));
       }, this.timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
       this.child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`, (error) => {
         if (!error) return;
-        clearTimeout(timer);
-        this.pending.delete(id);
-        reject(new Error('Could not send a request to StackQL MCP.'));
+        this.fail(new StackQLConnectionError('write'));
       });
     });
   }
@@ -88,7 +116,7 @@ export class StackQLClient {
   notify(method, params = {}) {
     if (this.failure || this.closed) throw this.failure ?? new Error('StackQL MCP connection is closed.');
     this.child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method, params })}\n`, (error) => {
-      if (error) this.fail(new Error('Could not notify StackQL MCP that initialization completed.'));
+      if (error) this.fail(new StackQLConnectionError('write'));
     });
   }
 
@@ -99,6 +127,10 @@ export class StackQLClient {
       clientInfo: { name: 'cost-sweeper-sdk', version: '0.1.0' },
     });
     if (!initialized?.serverInfo) throw new Error('StackQL MCP did not identify its server.');
+    if (initialized.instructions !== undefined && typeof initialized.instructions !== 'string') {
+      throw new Error('StackQL MCP returned invalid initialization instructions.');
+    }
+    this.instructions = initialized.instructions ?? '';
     this.notify('notifications/initialized');
     const listed = await this.request('tools/list');
     if (!Array.isArray(listed?.tools)) throw new Error('StackQL MCP returned an invalid tool listing.');

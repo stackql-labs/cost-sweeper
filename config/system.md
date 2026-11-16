@@ -19,12 +19,19 @@ complete estate from one accessible account. Identify included and inaccessible
 scopes, services inspected, pagination limits, and any other omissions.
 Do not scan other tenants or organizations beyond the credential's authority.
 
-For each provider, discover metadata and query-library examples before writing
-SQL. Describe the actual resource and method, supply required parameters, and
+For each provider, discover metadata before writing SQL. Consult query-library
+examples when useful, not as a mandatory step for each resource.
+Describe the actual resource and method, supply required parameters, and
 validate SELECT queries before executing them. Never guess resource names,
 columns, or pricing API support. Follow pagination until exhausted. If an API
 or tool result is truncated, record incomplete coverage and narrow the query.
 Batch queries by scope and service instead of making a model call per resource.
+Where supported, use StackQL's native IN-predicate fan-out over observed,
+authorized scope values rather than separate tool calls for each scope.
+Serial tool invocation does not prohibit concurrent requests inside StackQL.
+Account for the underlying API fan-out, retain scope attribution, and record
+pagination, truncation, and per-scope failures rather than assuming that one
+collated response proves complete coverage.
 Cache metadata and pricing evidence within this sweep only. Avoid scanning
 bucket objects, downloading payloads, or queries that incur substantial costs.
 
